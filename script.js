@@ -26,8 +26,16 @@ const FALLBACK_QUOTES = [
   { id: "q25", text: "You do not need more time. You need fewer distractions.", author: "Cal Newport", category: "Discipline" }
 ];
 
+const QUOTABLE_API = "https://api.quotable.io/random";
+const ZEN_QUOTES_API = "https://zenquotes.io/api/random";
 const FAVORITES_KEY = "dailyFuelFavorites";
 const CATEGORIES = ["All", "Success", "Discipline", "Life", "Money"];
+const CATEGORY_TAGS = {
+  Success: "success",
+  Discipline: "inspirational",
+  Life: "life",
+  Money: "business"
+};
 
 const refs = {
   categoryChips: document.getElementById("categoryChips"),
@@ -52,9 +60,9 @@ const refs = {
 const state = {
   category: "All",
   currentQuote: null,
-  quoteLibrary: [],
   favorites: loadFavorites(),
-  toastTimer: null
+  toastTimer: null,
+  isGenerating: false
 };
 
 function loadFavorites() {
@@ -75,39 +83,153 @@ function persistFavorites() {
   localStorage.setItem(FAVORITES_KEY, JSON.stringify(state.favorites));
 }
 
-function filteredQuotes() {
-  if (state.category === "All") {
-    return state.quoteLibrary;
+function createQuoteId(text, author, category) {
+  const seed = `${author}|${category}|${text}`;
+  let hash = 0;
+
+  for (let index = 0; index < seed.length; index += 1) {
+    hash = (hash * 31 + seed.charCodeAt(index)) % 2147483647;
   }
 
-  return state.quoteLibrary.filter((quote) => quote.category === state.category);
+  return `api-${Math.abs(hash).toString(36)}`;
 }
 
-function pickRandomQuote(excludeId) {
-  const list = filteredQuotes();
-  if (list.length === 0) {
-    return state.quoteLibrary[0] ?? null;
+function normalizeCategoryFromTags(tags, preferredCategory = "All") {
+  if (preferredCategory !== "All") {
+    return preferredCategory;
+  }
+
+  const lowercaseTags = Array.isArray(tags) ? tags.map((tag) => String(tag).toLowerCase()) : [];
+
+  if (lowercaseTags.some((tag) => tag.includes("success") || tag.includes("achievement"))) {
+    return "Success";
+  }
+
+  if (lowercaseTags.some((tag) => tag.includes("business") || tag.includes("money") || tag.includes("finance"))) {
+    return "Money";
+  }
+
+  if (lowercaseTags.some((tag) => tag.includes("discipline") || tag.includes("wisdom") || tag.includes("inspirational"))) {
+    return "Discipline";
+  }
+
+  return "Life";
+}
+
+function sanitizeQuote(rawQuote) {
+  const text = String(rawQuote?.text ?? "").trim();
+  if (!text) {
+    return null;
+  }
+
+  const author = String(rawQuote?.author ?? "Unknown").trim() || "Unknown";
+  const category = CATEGORIES.includes(rawQuote?.category) ? rawQuote.category : "Life";
+  const id = String(rawQuote?.id ?? createQuoteId(text, author, category));
+
+  return { id, text, author, category };
+}
+
+function pickRandomQuote(list, excludeId) {
+  if (!list.length) {
+    return null;
   }
 
   if (list.length === 1) {
     return list[0];
   }
 
-  let next = list[Math.floor(Math.random() * list.length)];
-  while (next.id === excludeId) {
-    next = list[Math.floor(Math.random() * list.length)];
+  let nextQuote = list[Math.floor(Math.random() * list.length)];
+  while (nextQuote.id === excludeId) {
+    nextQuote = list[Math.floor(Math.random() * list.length)];
   }
-  return next;
+
+  return nextQuote;
+}
+
+function getFallbackQuote(excludeId) {
+  const scopedQuotes = state.category === "All"
+    ? FALLBACK_QUOTES
+    : FALLBACK_QUOTES.filter((quote) => quote.category === state.category);
+  const quotePool = scopedQuotes.length ? scopedQuotes : FALLBACK_QUOTES;
+  return pickRandomQuote(quotePool, excludeId) ?? FALLBACK_QUOTES[0];
+}
+
+async function fetchFromQuotable() {
+  const url = new URL(QUOTABLE_API);
+  const categoryTag = CATEGORY_TAGS[state.category];
+  if (categoryTag) {
+    url.searchParams.set("tags", categoryTag);
+  }
+
+  const response = await fetch(url.toString(), { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error("Quotable unavailable.");
+  }
+
+  const payload = await response.json();
+  const quote = sanitizeQuote({
+    id: payload?._id,
+    text: payload?.content,
+    author: payload?.author,
+    category: normalizeCategoryFromTags(payload?.tags, state.category)
+  });
+
+  if (!quote) {
+    throw new Error("Invalid quote data from Quotable.");
+  }
+
+  return quote;
+}
+
+async function fetchFromZenQuotes() {
+  const response = await fetch(ZEN_QUOTES_API, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error("ZenQuotes unavailable.");
+  }
+
+  const payload = await response.json();
+  const firstQuote = Array.isArray(payload) ? payload[0] : null;
+  const quote = sanitizeQuote({
+    text: firstQuote?.q,
+    author: firstQuote?.a,
+    category: state.category === "All" ? "Life" : state.category
+  });
+
+  if (!quote) {
+    throw new Error("Invalid quote data from ZenQuotes.");
+  }
+
+  return quote;
+}
+
+async function fetchLiveQuote(excludeId) {
+  const providers = [fetchFromQuotable, fetchFromZenQuotes];
+
+  for (const provider of providers) {
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const quote = await provider();
+        if (quote && quote.id !== excludeId) {
+          return quote;
+        }
+      }
+    } catch {
+      // Move to the next provider if this one fails.
+    }
+  }
+
+  return null;
 }
 
 function quoteShareText(quote) {
-  return `\"${quote.text}\" - ${quote.author} (${quote.category})\n\n#DailyFuel`;
+  return `"${quote.text}" - ${quote.author} (${quote.category})\n\n#DailyFuel`;
 }
 
 function isCurrentFavorite() {
   if (!state.currentQuote) {
     return false;
   }
+
   return state.favorites.some((quote) => quote.id === state.currentQuote.id);
 }
 
@@ -157,13 +279,14 @@ function renderCategories() {
     chip.textContent = category;
     chip.dataset.category = category;
     chip.addEventListener("click", animatePress);
-    chip.addEventListener("click", () => {
+    chip.addEventListener("click", async () => {
       if (state.category === category) {
         return;
       }
+
       state.category = category;
       renderCategories();
-      generateQuote({ withLoader: false });
+      await generateQuote({ withLoader: true, showFallbackToast: true });
     });
     refs.categoryChips.append(chip);
   });
@@ -206,6 +329,12 @@ function closeFavorites() {
   refs.favoritesSheet.setAttribute("aria-hidden", "true");
   refs.sheetBackdrop.hidden = true;
   document.body.style.overflow = "";
+}
+
+function setLoadingState(isLoading) {
+  refs.generateBtn.disabled = isLoading;
+  refs.refreshBtn.disabled = isLoading;
+  refs.loadingOverlay.classList.toggle("active", isLoading);
 }
 
 async function copyText(value) {
@@ -269,24 +398,47 @@ function toggleFavorite() {
   refs.saveBtn.classList.toggle("is-favorite", !exists);
 }
 
-function generateQuote(options = { withLoader: true }) {
-  if (!state.quoteLibrary.length) {
+async function generateQuote(options = { withLoader: true, showFallbackToast: true }) {
+  if (state.isGenerating) {
     return;
   }
 
-  const nextQuote = pickRandomQuote(state.currentQuote?.id);
+  state.isGenerating = true;
   const withLoader = options.withLoader ?? true;
+  const showFallbackToast = options.showFallbackToast ?? true;
+  const previousQuoteId = state.currentQuote?.id;
 
   refs.quoteCard.classList.add("is-changing");
   if (withLoader) {
-    refs.loadingOverlay.classList.add("active");
+    setLoadingState(true);
+  }
+
+  let nextQuote = null;
+  let isFallback = false;
+
+  try {
+    nextQuote = await fetchLiveQuote(previousQuoteId);
+    if (!nextQuote) {
+      isFallback = true;
+      nextQuote = getFallbackQuote(previousQuoteId);
+    }
+  } catch {
+    isFallback = true;
+    nextQuote = getFallbackQuote(previousQuoteId);
   }
 
   window.setTimeout(() => {
     setQuote(nextQuote);
     refs.quoteCard.classList.remove("is-changing");
-    refs.loadingOverlay.classList.remove("active");
-  }, withLoader ? 430 : 230);
+    if (withLoader) {
+      setLoadingState(false);
+    }
+
+    state.isGenerating = false;
+    if (isFallback && showFallbackToast) {
+      showToast("Live quote unavailable. Showing backup fuel.");
+    }
+  }, withLoader ? 430 : 220);
 }
 
 function initializeEvents() {
@@ -295,8 +447,8 @@ function initializeEvents() {
     button.addEventListener("click", animatePress);
   });
 
-  refs.generateBtn.addEventListener("click", () => generateQuote({ withLoader: true }));
-  refs.refreshBtn.addEventListener("click", () => generateQuote({ withLoader: true }));
+  refs.generateBtn.addEventListener("click", () => generateQuote({ withLoader: true, showFallbackToast: true }));
+  refs.refreshBtn.addEventListener("click", () => generateQuote({ withLoader: true, showFallbackToast: true }));
   refs.saveBtn.addEventListener("click", toggleFavorite);
   refs.shareBtn.addEventListener("click", shareQuote);
   refs.openFavoritesBtn.addEventListener("click", openFavorites);
@@ -327,39 +479,11 @@ function initializeEvents() {
   });
 }
 
-async function loadQuoteLibrary() {
-  try {
-    const response = await fetch("quotes.json", { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error("Quote data could not be loaded.");
-    }
-
-    const payload = await response.json();
-    if (!Array.isArray(payload) || payload.length === 0) {
-      throw new Error("Invalid quote format.");
-    }
-
-    state.quoteLibrary = payload;
-  } catch {
-    state.quoteLibrary = FALLBACK_QUOTES;
-  }
-}
-
 async function initialize() {
-  refs.generateBtn.disabled = true;
-  refs.refreshBtn.disabled = true;
-  refs.loadingOverlay.classList.add("active");
-
-  await loadQuoteLibrary();
-
-  refs.loadingOverlay.classList.remove("active");
-  refs.generateBtn.disabled = false;
-  refs.refreshBtn.disabled = false;
-
   renderCategories();
   renderFavorites();
   initializeEvents();
-  setQuote(pickRandomQuote());
+  await generateQuote({ withLoader: true, showFallbackToast: false });
 }
 
 initialize();
